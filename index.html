@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Look to Reveal</title>
+    
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- MediaPipe Face Mesh for Gaze Tracking -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Inter', sans-serif;
+        }
+
+        /* CRT Scanline Effect */
+        .scanlines {
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.15) 50%,
+                rgba(0,0,0,0.15)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+        }
+
+        /* Vignette Effect */
+        .vignette {
+            background: radial-gradient(circle at center, rgba(0,0,0,0) 40%, rgba(0,0,0,0.8) 100%);
+            pointer-events: none;
+        }
+        
+        /* Smooth transitions for UI elements */
+        .fade-out {
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.5s ease-out;
+        }
+    </style>
+</head>
+<body class="relative flex items-center justify-center">
+
+    <!-- Hidden Video Element for Webcam Capture -->
+    <video id="videoElement" autoplay playsinline class="hidden"></video>
+
+    <!-- Main Canvas for Rendering -->
+    <canvas id="mainCanvas" class="absolute top-0 left-0 w-full h-full z-0"></canvas>
+
+    <!-- Visual Overlays (Scanlines & Vignette) -->
+    <div id="effectsOverlay" class="absolute top-0 left-0 w-full h-full z-10 scanlines vignette"></div>
+
+    <!-- UI Overlay -->
+    <div id="uiContainer" class="absolute z-20 flex flex-col items-center justify-center p-8 bg-black/60 backdrop-blur-md rounded-3xl border border-white/10 shadow-2xl text-center max-w-md w-[90%] transition-all duration-500">
+        <div class="mb-6">
+            <svg class="w-16 h-16 text-white mx-auto drop-shadow-[0_0_15px_rgba(255,255,255,0.5)]" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 5 8.268 7.943 9.542 12-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+            </svg>
+        </div>
+        <h1 class="text-3xl font-bold text-white mb-2 tracking-tight">Quantum Mirror</h1>
+        <p class="text-gray-300 mb-8 leading-relaxed">
+            The feed is lost in static. You must maintain direct visual contact to stabilize the transmission.
+        </p>
+        
+        <button id="startBtn" class="px-8 py-4 bg-white text-black font-semibold rounded-full hover:bg-gray-200 hover:scale-105 active:scale-95 transition-all duration-200 w-full flex items-center justify-center gap-2">
+            <span>Establish Connection</span>
+        </button>
+
+        <!-- Message Box for errors/status -->
+        <div id="messageBox" class="mt-4 text-sm text-red-400 font-medium hidden"></div>
+    </div>
+
+    <script>
+        // --- Core Variables ---
+        const video = document.getElementById('videoElement');
+        const canvas = document.getElementById('mainCanvas');
+        const ctx = canvas.getContext('2d', { alpha: false }); // Optimize canvas for no transparency needed at root
+        const effectsOverlay = document.getElementById('effectsOverlay');
+        const uiContainer = document.getElementById('uiContainer');
+        const startBtn = document.getElementById('startBtn');
+        const messageBox = document.getElementById('messageBox');
+
+        let isRunning = false;
+        let faceMesh = null;
+        
+        // Animation & Interpolation States
+        let targetInterference = 1.0; // 1.0 = full static, 0.0 = clear video
+        let currentInterference = 1.0;
+        let lastFaceDetectedTime = 0;
+        const FACE_TIMEOUT_MS = 600; // How long to wait after losing face before returning to static
+        let currentRoll = 0; // Tracks vertical V-SYNC desync offset
+
+        // Audio Variables
+        let audioCtx, noiseNode, gainNode;
+
+        // Pre-calculated Noise Frames (For high performance TV Static)
+        const noiseFrames = [];
+        const NUM_NOISE_FRAMES = 8;
+        const NOISE_RESOLUTION = 256; // Smaller resolution stretched out looks perfectly like chunky TV static
+        let currentNoiseFrame = 0;
+
+        // --- Initialization & Setup ---
+        
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function generateNoiseBuffers() {
+            for (let i = 0; i < NUM_NOISE_FRAMES; i++) {
+                const offscreen = document.createElement('canvas');
+                offscreen.width = NOISE_RESOLUTION;
+                offscreen.height = NOISE_RESOLUTION;
+                const oCtx = offscreen.getContext('2d');
+                
+                const imgData = oCtx.createImageData(NOISE_RESOLUTION, NOISE_RESOLUTION);
+                const data = imgData.data;
+                
+                for (let j = 0; j < data.length; j += 4) {
+                    // Generate a grayscale value with slight noise variance
+                    const val = Math.random() * 255;
+                    data[j] = val;     // R
+                    data[j+1] = val;   // G
+                    data[j+2] = val;   // B
+                    data[j+3] = 255;   // A
+                }
+                oCtx.putImageData(imgData, 0, 0);
+                noiseFrames.push(offscreen);
+            }
+        }
+
+        function initAudioStatic() {
+            try {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                
+                // Create a 2 second buffer of white noise
+                const bufferSize = audioCtx.sampleRate * 2;
+                const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+                const output = buffer.getChannelData(0);
+                
+                for (let i = 0; i < bufferSize; i++) {
+                    output[i] = Math.random() * 2 - 1; // White noise between -1.0 and 1.0
+                }
+                
+                noiseNode = audioCtx.createBufferSource();
+                noiseNode.buffer = buffer;
+                noiseNode.loop = true;
+                
+                // Lowpass filter to make it sound more like muffled TV static
+                const filter = audioCtx.createBiquadFilter();
+                filter.type = 'lowpass';
+                filter.frequency.value = 4000;
+                
+                gainNode = audioCtx.createGain();
+                gainNode.gain.value = 0; // Start muted
+                
+                noiseNode.connect(filter);
+                filter.connect(gainNode);
+                gainNode.connect(audioCtx.destination);
+                
+                noiseNode.start();
+            } catch (e) {
+                console.warn("Web Audio API not supported or blocked.", e);
+            }
+        }
+
+        function showMessage(msg, isError = false) {
+            messageBox.textContent = msg;
+            messageBox.style.display = 'block';
+            messageBox.className = `mt-4 text-sm font-medium ${isError ? 'text-red-400' : 'text-blue-300 animate-pulse'}`;
+        }
+
+        // --- Main Logic ---
+
+        startBtn.addEventListener('click', async () => {
+            startBtn.disabled = true;
+            startBtn.innerHTML = `
+                <svg class="animate-spin h-5 w-5 text-black" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                Initializing...
+            `;
+            showMessage("Accessing camera and loading neural models...", false);
+
+            // 1. Initialize Audio (must be on user interaction)
+            if (!audioCtx) initAudioStatic();
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume();
+            }
+
+            // 2. Pre-calculate static noise buffers
+            generateNoiseBuffers();
+
+            try {
+                // 3. Request Webcam
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+                    audio: false
+                });
+                video.srcObject = stream;
+                
+                // Wait for video metadata to load
+                await new Promise((resolve) => {
+                    video.onloadedmetadata = () => resolve();
+                });
+
+                // 4. Initialize MediaPipe Face Mesh
+                faceMesh = new FaceMesh({locateFile: (file) => {
+                    return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`;
+                }});
+                
+                faceMesh.setOptions({
+                    maxNumFaces: 1,
+                    refineLandmarks: true, // Crucial to enable Iris coordinates
+                    minDetectionConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+                
+                faceMesh.onResults(onFaceMeshResults);
+                
+                // Warm up the model (forces first initialization)
+                await faceMesh.initialize();
+
+                // 5. Start Render & Processing Loops
+                uiContainer.classList.add('fade-out');
+                isRunning = true;
+                
+                requestAnimationFrame(renderLoop);
+                processVideoFrames();
+
+            } catch (err) {
+                console.error(err);
+                showMessage("Camera access denied or unavailable. Please check permissions.", true);
+                startBtn.disabled = false;
+                startBtn.innerText = "Try Again";
+            }
+        });
+
+        // --- Gaze Tracking Processing ---
+
+        function onFaceMeshResults(results) {
+            let isLooking = false;
+
+            // Check if a face is detected and landmarks are available
+            if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                const landmarks = results.multiFaceLandmarks[0];
+
+                // Right Eye (from user's perspective, landmarks 33 to 133, iris 468)
+                const rightOuter = landmarks[33];
+                const rightInner = landmarks[133];
+                const rightIris = landmarks[468];
+
+                // Left Eye (landmarks 362 to 263, iris 473)
+                const leftInner = landmarks[362];
+                const leftOuter = landmarks[263];
+                const leftIris = landmarks[473];
+
+                // Calculate horizontal gaze ratio (normalized position of iris between corners)
+                const rightWidth = Math.abs(rightInner.x - rightOuter.x);
+                const rightGazeX = Math.abs(rightIris.x - rightOuter.x) / rightWidth;
+
+                const leftWidth = Math.abs(leftOuter.x - leftInner.x);
+                const leftGazeX = Math.abs(leftIris.x - leftInner.x) / leftWidth;
+
+                // Thresholds for looking center horizontally (approx 35% to 65% across the eye)
+                const rightLookingCenter = rightGazeX > 0.35 && rightGazeX < 0.65;
+                const leftLookingCenter = leftGazeX > 0.35 && leftGazeX < 0.65;
+
+                // Calculate vertical gaze (normalized position of iris between upper and lower eyelids)
+                const rightTop = landmarks[159];
+                const rightBottom = landmarks[145];
+                const rightHeight = Math.abs(rightBottom.y - rightTop.y);
+                const rightGazeY = Math.abs(rightIris.y - rightTop.y) / rightHeight;
+                
+                const leftTop = landmarks[386];
+                const leftBottom = landmarks[374];
+                const leftHeight = Math.abs(leftBottom.y - leftTop.y);
+                const leftGazeY = Math.abs(leftIris.y - leftTop.y) / leftHeight;
+
+                // Thresholds for looking center vertically
+                const rightLookingV = rightGazeY > 0.30 && rightGazeY < 0.75;
+                const leftLookingV = leftGazeY > 0.30 && leftGazeY < 0.75;
+
+                // Direct eye contact is established if BOTH eyes are centered horizontally and vertically
+                if (rightLookingCenter && leftLookingCenter && rightLookingV && leftLookingV) {
+                    isLooking = true;
+                }
+            }
+
+            if (isLooking) {
+                targetInterference = 0.0; // Clear the static
+                lastFaceDetectedTime = Date.now();
+            } else {
+                // Apply a small timeout before returning static so it doesn't flicker on blinks
+                if (Date.now() - lastFaceDetectedTime > FACE_TIMEOUT_MS) {
+                    targetInterference = 1.0; // Return to heavy static
+                }
+            }
+        }
+
+        let isProcessing = false;
+        async function processVideoFrames() {
+            if (!isRunning) return;
+            
+            // Only send frame if previous one finished processing to avoid queuing backlog
+            if (!isProcessing && video.readyState >= 2) {
+                isProcessing = true;
+                await faceMesh.send({image: video});
+                isProcessing = false;
+            }
+            
+            // Continue the processing loop
+            requestAnimationFrame(processVideoFrames);
+        }
+
+        // --- Render Engine ---
+
+        function renderLoop() {
+            if (!isRunning) return;
+
+            // 1. Calculate Stability Interpolation (Lerp)
+            currentInterference += (targetInterference - currentInterference) * 0.08;
+            
+            // Snap to limits if extremely close to avoid infinite math
+            if (Math.abs(currentInterference - targetInterference) < 0.001) {
+                currentInterference = targetInterference;
+            }
+
+            const interference = currentInterference;
+
+            // 2. Update Overlays & Audio based on current state
+            effectsOverlay.style.opacity = interference;
+            
+            if (gainNode) {
+                // Max volume at 0.15 to avoid blowing out user's ears
+                gainNode.gain.value = interference * 0.15; 
+            }
+
+            const w = canvas.width;
+            const h = canvas.height;
+
+            // Clear canvas
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, w, h);
+
+            // 3. Draw Webcam Feed (Simulate object-fit: cover)
+            if (video.readyState >= 2) {
+                const videoRatio = video.videoWidth / video.videoHeight;
+                const canvasRatio = w / h;
+                
+                let drawW, drawH, startX, startY;
+
+                if (videoRatio > canvasRatio) {
+                    // Video is wider than canvas
+                    drawH = h;
+                    drawW = h * videoRatio;
+                    startX = (w - drawW) / 2;
+                    startY = 0;
+                } else {
+                    // Video is taller than canvas
+                    drawW = w;
+                    drawH = w / videoRatio;
+                    startX = 0;
+                    startY = (h - drawH) / 2;
+                }
+
+                // --- Calculate Desync (Roll & Jitter) ---
+                if (targetInterference === 0.0 && interference < 0.1) {
+                    // Smoothly lock the frame back into place (V-SYNC acquired)
+                    if (currentRoll > drawH / 2) {
+                        currentRoll += (drawH - currentRoll) * 0.15; // Push forward to wrap
+                        if (currentRoll > drawH - 1) currentRoll = 0;
+                    } else {
+                        currentRoll *= 0.85; // Pull back to 0
+                    }
+                } else {
+                    // Roll speed scales non-linearly with interference
+                    currentRoll += 40 * (interference * interference); 
+                    currentRoll %= drawH;
+                }
+                
+                // Horizontal jitter based on interference level
+                const jitterX = (Math.random() - 0.5) * 80 * interference;
+
+                // Mirror the video horizontally for natural interaction
+                ctx.save();
+                ctx.translate(w, 0);
+                ctx.scale(-1, 1);
+                
+                // Coordinates adjusted for flipped context and desync effects
+                const effectiveX = -startX + jitterX;
+                
+                // Draw primary wrapped frame shifted downwards
+                ctx.drawImage(video, effectiveX, startY + currentRoll, drawW, drawH);
+                
+                // Draw secondary wrapped frame (above) to create continuous loop illusion
+                if (currentRoll > 0) {
+                    ctx.drawImage(video, effectiveX, startY + currentRoll - drawH, drawW, drawH);
+                }
+                
+                ctx.restore();
+            }
+
+            // 4. Draw Animated Static Overlay
+            if (interference > 0.01) { // Optimization: don't draw if basically invisible
+                ctx.save();
+                ctx.globalAlpha = interference;
+                
+                // Cycle through pre-rendered noise frames
+                currentNoiseFrame = (currentNoiseFrame + 1) % NUM_NOISE_FRAMES;
+                const noiseCanvas = noiseFrames[currentNoiseFrame];
+                
+                // Draw the noise stretched across the screen
+                ctx.drawImage(noiseCanvas, 0, 0, w, h);
+                ctx.restore();
+            }
+
+            // 5. Request Next Frame
+            requestAnimationFrame(renderLoop);
+        }
+    </script>
+</body>
+</html>
