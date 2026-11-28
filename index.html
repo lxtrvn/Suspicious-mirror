@@ -95,8 +95,8 @@
         let faceMesh = null;
         
         // Animation & Interpolation States
-        let targetInterference = 1.0; // 1.0 = full static, 0.0 = clear video
-        let currentInterference = 1.0;
+        let targetInterference = 0.0; // 1.0 = full static, 0.0 = clear video
+        let currentInterference = 0.0;
         let lastFaceDetectedTime = 0;
         const FACE_TIMEOUT_MS = 600; // How long to wait after losing face before returning to static
         let currentRoll = 0; // Tracks vertical V-SYNC desync offset
