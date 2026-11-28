@@ -302,12 +302,12 @@
             }
 
             if (isLooking) {
-                targetInterference = 0.0; // Clear the static
+                targetInterference = 1.0; // Clear the static
                 lastFaceDetectedTime = Date.now();
             } else {
                 // Apply a small timeout before returning static so it doesn't flicker on blinks
                 if (Date.now() - lastFaceDetectedTime > FACE_TIMEOUT_MS) {
-                    targetInterference = 1.0; // Return to heavy static
+                    targetInterference = 0.0; // Return to heavy static
                 }
             }
         }
